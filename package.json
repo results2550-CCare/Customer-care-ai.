@@ -1,0 +1,460 @@
+/**
+ * Customer Care AI — Single-File Proof-of-Concept (Enterprise-style)
+ * - ONE file only (server + HTML + widget + inventory + audit logs)
+ * - Real AI via OpenAI (API key stays server-side)
+ * - Inventory-aware (embedded CSV)
+ * - Trust tiers / modes: OFF | FAQ | READ_ONLY | ASSISTED | AUTO
+ * - Audit logging (JSONL file)
+ *
+ * Run:
+ *   1) npm init -y
+ *   2) npm i express openai
+ *   3) set OPENAI_API_KEY (see below)
+ *   4) node customer-care-ai.js
+ *
+ * Environment:
+ *   mac/linux:
+ *     export OPENAI_API_KEY="YOUR_KEY"
+ *     export PORT=8787
+ *     export TENANT_ID="demo"
+ *     export BUSINESS_NAME="Jimmy Bob's Solicitors"
+ *     export MODE="READ_ONLY"
+ *
+ *   windows (powershell):
+ *     $env:OPENAI_API_KEY="YOUR_KEY"
+ *     $env:PORT="8787"
+ *     $env:TENANT_ID="demo"
+ *     $env:BUSINESS_NAME="Jimmy Bob's Solicitors"
+ *     $env:MODE="READ_ONLY"
+ */
+
+import express from "express";
+import fs from "fs";
+import crypto from "crypto";
+import OpenAI from "openai";
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+// -------------------- CONFIG --------------------
+const PORT = Number(process.env.PORT || 8787);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+if (!OPENAI_API_KEY) {
+  console.error("Missing OPENAI_API_KEY environment variable.");
+  process.exit(1);
+}
+
+const TENANT_ID = String(process.env.TENANT_ID || "demo").trim();
+const BUSINESS_NAME = String(process.env.BUSINESS_NAME || "Customer Care AI Demo").trim();
+
+// Modes (trust tiers):
+// OFF: widget refuses
+// FAQ: answers using only "public info" + business policy (no inventory)
+// READ_ONLY: can reference inventory, cannot modify
+// ASSISTED: suggests actions; requires human approval (simulation)
+// AUTO: may execute simulated actions (still no real integrations here)
+let MODE = String(process.env.MODE || "READ_ONLY").trim().toUpperCase();
+const ALLOWED_MODES = new Set(["OFF", "FAQ", "READ_ONLY", "ASSISTED", "AUTO"]);
+if (!ALLOWED_MODES.has(MODE)) MODE = "READ_ONLY";
+
+// Audit log file (append-only)
+const AUDIT_FILE = `./audit-${TENANT_ID}.jsonl`;
+
+// Rate limit (very basic)
+const MAX_MSG_CHARS = 2000;
+
+// -------------------- INVENTORY (EMBEDDED CSV) --------------------
+// Replace this CSV with any business inventory/services list.
+// sku,name,qty,price,currency,notes
+const INVENTORY_CSV = `sku,name,qty,price,currency,notes
+JB-001,Initial Consultation (30 min),12,150,AUD,In-office or phone
+JB-002,Initial Consultation (60 min),6,280,AUD,In-office preferred
+JB-003,Contract Review,3,450,AUD,Standard commercial review
+JB-004,Wills & Estates Package,2,990,AUD,Includes 2 revisions
+JB-005,Property Conveyancing (Basic),1,2200,AUD,Subject to complexity
+`;
+
+// Parse CSV without extra deps (simple, good enough for POC)
+function parseCsv(csv) {
+  const lines = csv.trim().split(/\r?\n/);
+  const header = lines.shift().split(",").map(s => s.trim());
+  return lines.map(line => {
+    // naive CSV split (works if no commas inside fields)
+    const cols = line.split(",").map(s => s.trim());
+    const obj = {};
+    header.forEach((h, i) => (obj[h] = cols[i] ?? ""));
+    // normalize
+    obj.qty = Number(obj.qty || 0);
+    obj.price = Number(obj.price || 0);
+    return obj;
+  });
+}
+
+const INVENTORY = parseCsv(INVENTORY_CSV);
+
+// -------------------- OPENAI --------------------
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// -------------------- UTILS --------------------
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function auditLog(event) {
+  const row = { ts: nowIso(), tenantId: TENANT_ID, ...event };
+  fs.appendFileSync(AUDIT_FILE, JSON.stringify(row) + "\n", "utf8");
+}
+
+function safeText(s, max = MAX_MSG_CHARS) {
+  if (typeof s !== "string") return "";
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function randomId() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+// Basic inventory lookup helper
+function findInventoryMatches(query) {
+  const q = String(query || "").toLowerCase();
+  if (!q) return [];
+  const hits = INVENTORY.filter(item => {
+    const hay = `${item.sku} ${item.name} ${item.notes}`.toLowerCase();
+    return hay.includes(q);
+  });
+  // Return up to 8
+  return hits.slice(0, 8);
+}
+
+// -------------------- HTML (SINGLE PAGE + WIDGET) --------------------
+function renderHtml() {
+  const modeBadge = MODE;
+  const inventoryCount = INVENTORY.length;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${escapeHtml(BUSINESS_NAME)} — Customer Care AI POC</title>
+<style>
+  :root{
+    --bg:#0b1220; --card:#0f1b33; --text:#e8eefc; --muted:#a9b6d3;
+    --brand:#2563eb; --brand2:#1d4ed8; --danger:#ef4444; --ok:#22c55e;
+    --shadow: 0 20px 60px rgba(0,0,0,.45);
+    --radius:14px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+    --sans: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  }
+  body{margin:0;background:linear-gradient(180deg,#070b14,#0b1220);color:var(--text);font-family:var(--sans);}
+  .wrap{max-width:1100px;margin:0 auto;padding:28px;}
+  .top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;}
+  h1{margin:0;font-size:28px;letter-spacing:.2px;}
+  .sub{margin-top:8px;color:var(--muted);max-width:760px;line-height:1.45;}
+  .panel{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:var(--radius);padding:14px 16px;box-shadow:var(--shadow);}
+  .kpi{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;}
+  .pill{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:rgba(37,99,235,.14);border:1px solid rgba(37,99,235,.28);color:#dbe7ff;font-size:13px;}
+  .dot{width:8px;height:8px;border-radius:999px;background:var(--ok);}
+  .dot.off{background:var(--danger);}
+  .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px;margin-top:18px;}
+  @media (max-width:980px){.grid{grid-template-columns:1fr;}}
+  .boxTitle{font-weight:700;margin-bottom:10px;}
+  .mono{font-family:var(--mono);font-size:12px;color:var(--muted);line-height:1.45;white-space:pre-wrap;}
+  .btnRow{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;}
+  button{appearance:none;border:0;border-radius:10px;padding:10px 12px;background:var(--brand);color:white;font-weight:700;cursor:pointer}
+  button:hover{background:var(--brand2)}
+  button.secondary{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:var(--text)}
+  button.secondary:hover{background:rgba(255,255,255,.12)}
+  .danger{background:rgba(239,68,68,.12)!important;border:1px solid rgba(239,68,68,.26)!important;color:#ffd1d1!important}
+  .danger:hover{background:rgba(239,68,68,.18)!important}
+  .note{margin-top:10px;color:var(--muted);font-size:13px;line-height:1.45}
+
+  /* WIDGET */
+  #ccai_toggle{
+    position:fixed;right:18px;bottom:18px;
+    width:62px;height:62px;border-radius:999px;
+    background:var(--brand);color:white;display:flex;align-items:center;justify-content:center;
+    font-size:26px;box-shadow:var(--shadow);cursor:pointer;user-select:none;
+  }
+  #ccai_box{
+    position:fixed;right:18px;bottom:92px;
+    width:360px;max-width:calc(100vw - 36px);
+    height:520px;max-height:calc(100vh - 120px);
+    background:white;color:#0b1220;border-radius:16px;
+    display:none;flex-direction:column;box-shadow:var(--shadow);overflow:hidden;
+  }
+  #ccai_head{
+    padding:12px 12px;background:var(--brand);color:white;display:flex;align-items:center;justify-content:space-between;gap:10px;
+  }
+  #ccai_head b{font-size:14px}
+  #ccai_mode{
+    font-family:var(--mono);font-size:11px;padding:6px 8px;border-radius:999px;
+    background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.25);
+  }
+  #ccai_msgs{flex:1;padding:12px;overflow:auto;background:#f6f8ff}
+  .m{margin:0 0 10px 0;display:flex;gap:10px}
+  .bub{padding:10px 12px;border-radius:14px;max-width:80%;font-size:13px;line-height:1.35;white-space:pre-wrap}
+  .you{justify-content:flex-end}
+  .you .bub{background:#111827;color:white;border-bottom-right-radius:6px}
+  .ai .bub{background:white;border:1px solid rgba(17,24,39,.12);border-bottom-left-radius:6px}
+  #ccai_inbar{display:flex;gap:8px;padding:10px;border-top:1px solid rgba(17,24,39,.12);background:white}
+  #ccai_in{flex:1;border:1px solid rgba(17,24,39,.18);border-radius:10px;padding:10px;font-size:14px;outline:none}
+  #ccai_send{border-radius:10px;padding:10px 12px;font-weight:800}
+  #ccai_hint{padding:8px 12px;font-size:12px;color:rgba(17,24,39,.65);background:rgba(37,99,235,.08);border-top:1px solid rgba(37,99,235,.12)}
+  a{color:#bcd2ff}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>${escapeHtml(BUSINESS_NAME)} — AI Proof of Concept</h1>
+        <div class="sub">
+          Single-file demo: widget + real AI + inventory awareness + trust tiers + audit logs.
+        </div>
+        <div class="kpi">
+          <span class="pill"><span class="dot ${MODE === "OFF" ? "off" : ""}"></span>Mode: <b>${escapeHtml(modeBadge)}</b></span>
+          <span class="pill">Tenant: <b>${escapeHtml(TENANT_ID)}</b></span>
+          <span class="pill">Inventory records: <b>${inventoryCount}</b></span>
+        </div>
+      </div>
+
+      <div class="panel" style="min-width:320px;max-width:420px;">
+        <div class="boxTitle">Admin (local)</div>
+        <div class="mono">Switch modes server-side (persists until restart unless you edit the file/env).</div>
+        <div class="btnRow">
+          <button class="secondary" onclick="setMode('FAQ')">FAQ</button>
+          <button class="secondary" onclick="setMode('READ_ONLY')">READ_ONLY</button>
+          <button class="secondary" onclick="setMode('ASSISTED')">ASSISTED</button>
+          <button class="secondary" onclick="setMode('AUTO')">AUTO</button>
+          <button class="secondary danger" onclick="setMode('OFF')">OFF</button>
+        </div>
+        <div class="note">
+          Audit log file: <span class="mono">${escapeHtml(AUDIT_FILE)}</span><br/>
+          Tip: Ask the widget “Do you have Contract Review available?” or “What’s the price of a 60 min consult?”
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <div class="boxTitle">What this demo proves</div>
+        <div class="mono">
+- Real AI responses (server calls OpenAI; key never exposed)
+- Inventory-aware answers when mode allows
+- Trust tiers: OFF / FAQ / READ_ONLY / ASSISTED / AUTO
+- Audit trail: every message logged
+- Universal widget: can be embedded on any site (this page includes it inline)
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="boxTitle">Inventory snapshot (embedded)</div>
+        <div class="mono">${escapeHtml(INVENTORY_CSV)}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WIDGET -->
+  <div id="ccai_toggle" title="Customer Care AI" onclick="ccaiToggle()">💬</div>
+
+  <div id="ccai_box">
+    <div id="ccai_head">
+      <div style="display:flex;flex-direction:column;gap:2px">
+        <b>Customer Care AI</b>
+        <span style="font-size:12px;opacity:.9">${escapeHtml(BUSINESS_NAME)}</span>
+      </div>
+      <div id="ccai_mode">MODE: ${escapeHtml(MODE)}</div>
+    </div>
+
+    <div id="ccai_msgs"></div>
+
+    <div id="ccai_inbar">
+      <input id="ccai_in" placeholder="Ask about stock, price, hours, bookings..." maxlength="2000"/>
+      <button id="ccai_send" onclick="ccaiSend()">Send</button>
+    </div>
+
+    <div id="ccai_hint">
+      Privacy: This demo logs messages for auditing. Do not paste secrets.
+    </div>
+  </div>
+
+<script>
+  // --- Minimal admin controls ---
+  async function setMode(mode){
+    const res = await fetch("/api/mode", {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ mode })
+    });
+    const data = await res.json();
+    if(data && data.ok){
+      location.reload();
+    } else {
+      alert("Failed: " + (data && data.error ? data.error : "unknown"));
+    }
+  }
+
+  // --- Widget UI ---
+  const box = document.getElementById("ccai_box");
+  const msgs = document.getElementById("ccai_msgs");
+  const input = document.getElementById("ccai_in");
+
+  function ccaiToggle(){
+    box.style.display = (box.style.display === "flex") ? "none" : "flex";
+    if(box.style.display === "flex" && msgs.childElementCount === 0){
+      addMsg("ai", "Hello. Ask me about availability, pricing, or services.\\n\\nCurrent mode: ${escapeHtml(MODE)}");
+    }
+    if(box.style.display === "flex") input.focus();
+  }
+
+  function addMsg(who, text){
+    const row = document.createElement("div");
+    row.className = "m " + (who === "you" ? "you" : "ai");
+    const bub = document.createElement("div");
+    bub.className = "bub";
+    bub.textContent = text;
+    row.appendChild(bub);
+    msgs.appendChild(row);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  async function ccaiSend(){
+    const text = (input.value || "").trim();
+    if(!text) return;
+    input.value = "";
+    addMsg("you", text);
+    addMsg("ai", "…");
+
+    // replace last placeholder on response
+    const placeholder = msgs.lastChild;
+
+    try{
+      const res = await fetch("/api/chat", {
+        method:"POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ message: text })
+      });
+      const data = await res.json();
+      const reply = (data && data.reply) ? data.reply : "No reply.";
+      placeholder.querySelector(".bub").textContent = reply;
+    }catch(e){
+      placeholder.querySelector(".bub").textContent = "Error contacting server.";
+    }
+  }
+
+  input.addEventListener("keydown", (e)=>{
+    if(e.key === "Enter") ccaiSend();
+  });
+</script>
+</body>
+</html>`;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+// -------------------- ROUTES --------------------
+app.get("/", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderHtml());
+});
+
+// Change mode (admin)
+app.post("/api/mode", (req, res) => {
+  const mode = String(req.body?.mode || "").trim().toUpperCase();
+  if (!ALLOWED_MODES.has(mode)) {
+    return res.status(400).json({ ok: false, error: "Invalid mode" });
+  }
+  MODE = mode;
+  auditLog({ type: "mode_change", mode });
+  return res.json({ ok: true, mode });
+});
+
+// Chat endpoint (real AI)
+app.post("/api/chat", async (req, res) => {
+  const userMsg = safeText(req.body?.message || "");
+  if (!userMsg) return res.status(400).json({ reply: "Empty message." });
+
+  // Always audit input
+  const requestId = randomId();
+  auditLog({ type: "chat_in", requestId, mode: MODE, message: userMsg });
+
+  if (MODE === "OFF") {
+    const reply = "AI is disabled for this business right now.";
+    auditLog({ type: "chat_out", requestId, reply });
+    return res.json({ reply });
+  }
+
+  // Inventory context only when allowed
+  const inventoryContext =
+    (MODE === "READ_ONLY" || MODE === "ASSISTED" || MODE === "AUTO")
+      ? INVENTORY
+      : [];
+
+  // Simple deterministic pre-check: direct matches for quick answers
+  // (still also goes to AI, but gives it clean facts)
+  const quickHits = (MODE === "READ_ONLY" || MODE === "ASSISTED" || MODE === "AUTO")
+    ? findInventoryMatches(userMsg)
+    : [];
+
+  const system = `
+You are "Customer Care AI" for the business:
+Business: ${BUSINESS_NAME}
+Tenant: ${TENANT_ID}
+
+MODE (trust tier): ${MODE}
+
+Hard rules (must obey):
+- If MODE=FAQ: You must NOT use any inventory data. Answer only generic + publicly provided policy tone.
+- If MODE=READ_ONLY: You MAY reference inventory data below. You must NOT claim you changed anything. Only report stock/price/availability.
+- If MODE=ASSISTED: You MAY suggest actions, but must ask for confirmation (human approval). Do NOT claim you executed anything.
+- If MODE=AUTO: You MAY propose executing simulated actions, but be explicit that it's a simulation (no real integrations wired yet).
+- Never request or expose secrets (passwords, API keys).
+- If asked to access private client lists/emails/computer data: refuse and explain that it requires explicit permission + approved integration.
+
+Answer style:
+- Direct, short, businesslike.
+- If inventory is relevant: include SKU, price, qty, and next step.
+
+Inventory (if available in this mode):
+${inventoryContext.length ? JSON.stringify(inventoryContext) : "(not available in this mode)"}
+
+Quick matches (if any):
+${quickHits.length ? JSON.stringify(quickHits) : "(none)"}
+`.trim();
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userMsg }
+      ],
+    });
+
+    const reply = completion.choices?.[0]?.message?.content?.trim() || "No response.";
+    auditLog({ type: "chat_out", requestId, reply });
+    return res.json({ reply });
+  } catch (err) {
+    const reply = "AI error (check server logs).";
+    auditLog({ type: "chat_out", requestId, reply, error: String(err?.message || err) });
+    return res.status(500).json({ reply });
+  }
+});
+
+// -------------------- START --------------------
+app.listen(PORT, () => {
+  console.log(`Customer Care AI POC running: http://localhost:${PORT}`);
+  console.log(`Tenant: ${TENANT_ID}`);
+  console.log(`Business: ${BUSINESS_NAME}`);
+  console.log(`Mode: ${MODE}`);
+  console.log(`Audit log: ${AUDIT_FILE}`);
+});
