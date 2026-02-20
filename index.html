@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Customer Care AI — Complete Demo</title>
+
+<style>
+:root{
+--bg:#0b1220;
+--text:#e8eefc;
+--muted:#a9b6d3;
+--brand:#2563eb;
+--shadow:0 20px 60px rgba(0,0,0,.45)
+}
+body{
+margin:0;
+background:linear-gradient(180deg,#070b14,#0b1220);
+color:var(--text);
+font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif
+}
+.wrap{max-width:1100px;margin:0 auto;padding:28px}
+.panel{
+background:rgba(255,255,255,.04);
+border:1px solid rgba(255,255,255,.08);
+border-radius:14px;
+padding:16px;
+box-shadow:var(--shadow)
+}
+h1{margin:0;font-size:28px}
+.sub{margin-top:8px;color:var(--muted)}
+button{
+border:0;
+border-radius:10px;
+padding:10px 12px;
+background:var(--brand);
+color:white;
+font-weight:700;
+cursor:pointer
+}
+button.secondary{
+background:rgba(255,255,255,.08);
+border:1px solid rgba(255,255,255,.12)
+}
+
+/* Widget */
+#chatToggle{
+position:fixed;
+right:18px;
+bottom:18px;
+width:60px;
+height:60px;
+border-radius:50%;
+background:var(--brand);
+display:flex;
+align-items:center;
+justify-content:center;
+font-size:24px;
+cursor:pointer
+}
+#chatBox{
+position:fixed;
+right:18px;
+bottom:90px;
+width:360px;
+height:520px;
+background:white;
+color:black;
+border-radius:14px;
+display:none;
+flex-direction:column;
+box-shadow:var(--shadow)
+}
+#chatHeader{
+background:var(--brand);
+color:white;
+padding:12px;
+display:flex;
+justify-content:space-between
+}
+#chatMessages{
+flex:1;
+padding:12px;
+overflow:auto;
+background:#f6f8ff
+}
+.msg{margin-bottom:10px}
+.you{font-weight:bold}
+#chatInputBar{
+display:flex;
+padding:10px;
+border-top:1px solid #ddd
+}
+#chatInput{
+flex:1;
+padding:8px;
+border-radius:8px;
+border:1px solid #ccc
+}
+</style>
+</head>
+
+<body>
+
+<div class="wrap">
+<div class="panel">
+<h1>Customer Care AI — Full Demo</h1>
+<div class="sub">
+Static proof-of-concept. Persona switching + inventory awareness.
+</div>
+
+<br>
+
+<button class="secondary" onclick="setMode('professional')">Professional Tone</button>
+<button class="secondary" onclick="setMode('surf')">Surf Tone</button>
+
+</div>
+</div>
+
+<div id="chatToggle" onclick="toggleChat()">💬</div>
+
+<div id="chatBox">
+<div id="chatHeader">
+<span>Customer Care AI</span>
+<span id="modeLabel">Mode: professional</span>
+</div>
+
+<div id="chatMessages"></div>
+
+<div id="chatInputBar">
+<input id="chatInput" placeholder="Ask about products or services..." />
+<button onclick="sendMessage()">Send</button>
+</div>
+</div>
+
+<script>
+let MODE="professional";
+
+const INVENTORY=[
+{sku:"JB-001",name:"Consultation 30min",qty:12,price:150},
+{sku:"JB-002",name:"Consultation 60min",qty:6,price:280},
+{sku:"JB-003",name:"Contract Review",qty:3,price:450}
+];
+
+function setMode(m){
+MODE=m;
+document.getElementById("modeLabel").innerText="Mode: "+m;
+addMessage("AI","Tone switched to "+m+".");
+}
+
+function toggleChat(){
+const box=document.getElementById("chatBox");
+box.style.display=box.style.display==="flex"?"none":"flex";
+if(box.style.display==="flex" && document.getElementById("chatMessages").children.length===0){
+addMessage("AI","Hello. How can I assist you today?");
+}
+}
+
+function addMessage(sender,text){
+const div=document.createElement("div");
+div.className="msg";
+div.innerHTML="<b>"+sender+":</b> "+text;
+document.getElementById("chatMessages").appendChild(div);
+document.getElementById("chatMessages").scrollTop=99999;
+}
+
+function generateReply(text){
+text=text.toLowerCase();
+
+if(text.includes("consult")){
+let item=INVENTORY[0];
+if(MODE==="professional"){
+return item.name+" is available. Price is $"+item.price+". We currently have "+item.qty+" slots available.";
+}else{
+return "Yeah mate, we’ve got "+item.name+" going for $"+item.price+" and "+item.qty+" spots left. Keen?";
+}
+}
+
+if(MODE==="professional"){
+return "Thank you for your enquiry. Please let me know how I may assist further.";
+}else{
+return "Hey legend, what else you chasing today?";
+}
+}
+
+function sendMessage(){
+const input=document.getElementById("chatInput");
+if(!input.value.trim())return;
+addMessage("You",input.value);
+addMessage("AI",generateReply(input.value));
+input.value="";
+}
+
+document.getElementById("chatInput").addEventListener("keydown",function(e){
+if(e.key==="Enter")sendMessage();
+});
+</script>
+
+</body>
+</html>
