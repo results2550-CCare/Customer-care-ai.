@@ -1,200 +1,294 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Customer Care AI — Complete Demo</title>
-
-<style>
-:root{
---bg:#0b1220;
---text:#e8eefc;
---muted:#a9b6d3;
---brand:#2563eb;
---shadow:0 20px 60px rgba(0,0,0,.45)
-}
-body{
-margin:0;
-background:linear-gradient(180deg,#070b14,#0b1220);
-color:var(--text);
-font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif
-}
-.wrap{max-width:1100px;margin:0 auto;padding:28px}
-.panel{
-background:rgba(255,255,255,.04);
-border:1px solid rgba(255,255,255,.08);
-border-radius:14px;
-padding:16px;
-box-shadow:var(--shadow)
-}
-h1{margin:0;font-size:28px}
-.sub{margin-top:8px;color:var(--muted)}
-button{
-border:0;
-border-radius:10px;
-padding:10px 12px;
-background:var(--brand);
-color:white;
-font-weight:700;
-cursor:pointer
-}
-button.secondary{
-background:rgba(255,255,255,.08);
-border:1px solid rgba(255,255,255,.12)
-}
-
-/* Widget */
-#chatToggle{
-position:fixed;
-right:18px;
-bottom:18px;
-width:60px;
-height:60px;
-border-radius:50%;
-background:var(--brand);
-display:flex;
-align-items:center;
-justify-content:center;
-font-size:24px;
-cursor:pointer
-}
-#chatBox{
-position:fixed;
-right:18px;
-bottom:90px;
-width:360px;
-height:520px;
-background:white;
-color:black;
-border-radius:14px;
-display:none;
-flex-direction:column;
-box-shadow:var(--shadow)
-}
-#chatHeader{
-background:var(--brand);
-color:white;
-padding:12px;
-display:flex;
-justify-content:space-between
-}
-#chatMessages{
-flex:1;
-padding:12px;
-overflow:auto;
-background:#f6f8ff
-}
-.msg{margin-bottom:10px}
-.you{font-weight:bold}
-#chatInputBar{
-display:flex;
-padding:10px;
-border-top:1px solid #ddd
-}
-#chatInput{
-flex:1;
-padding:8px;
-border-radius:8px;
-border:1px solid #ccc
-}
-</style>
-</head>
-
-<body>
-
-<div class="wrap">
-<div class="panel">
-<h1>Customer Care AI — Full Demo</h1>
-<div class="sub">
-Static proof-of-concept. Persona switching + inventory awareness.
-</div>
-
-<br>
-
-<button class="secondary" onclick="setMode('professional')">Professional Tone</button>
-<button class="secondary" onclick="setMode('surf')">Surf Tone</button>
-
-</div>
-</div>
-
-<div id="chatToggle" onclick="toggleChat()">💬</div>
-
-<div id="chatBox">
-<div id="chatHeader">
-<span>Customer Care AI</span>
-<span id="modeLabel">Mode: professional</span>
-</div>
-
-<div id="chatMessages"></div>
-
-<div id="chatInputBar">
-<input id="chatInput" placeholder="Ask about products or services..." />
-<button onclick="sendMessage()">Send</button>
-</div>
-</div>
-
 <script>
-let MODE="professional";
+/* =========================================================
+   HANDS-FREE VOICE LOOP (Enable once, then it runs itself)
+   - Enable Voice: requests mic permission + checks support
+   - Auto listen loop: listen -> auto-send -> speak -> listen
+   - Clears transcript every cycle (no retained text)
+   - No "press talk every time"
+   ========================================================= */
 
-const INVENTORY=[
-{sku:"JB-001",name:"Consultation 30min",qty:12,price:150},
-{sku:"JB-002",name:"Consultation 60min",qty:6,price:280},
-{sku:"JB-003",name:"Contract Review",qty:3,price:450}
-];
+const CCare = (() => {
+  // ---------- CONFIG ----------
+  const CFG = {
+    lang: "en-AU",
+    autoRestartDelayMs: 250,    // restart listen after speaking
+    endSilenceMs: 800,          // if your browser supports it (Chrome flags)
+    speakReplies: true,         // set false if you only want text replies
+    debug: false,
+  };
 
-function setMode(m){
-MODE=m;
-document.getElementById("modeLabel").innerText="Mode: "+m;
-addMessage("AI","Tone switched to "+m+".");
-}
+  // ---------- STATE ----------
+  const state = {
+    mode: "idle",               // idle | permission | ready | listening | thinking | speaking | error
+    voiceEnabled: false,
+    handsFree: true,
+    lastTranscript: "",
+    isUserSpeaking: false,
+    abortCtrl: null,
+    recognition: null,
+    micStream: null,
+    speaking: false,
+    stopAll: false,
+  };
 
-function toggleChat(){
-const box=document.getElementById("chatBox");
-box.style.display=box.style.display==="flex"?"none":"flex";
-if(box.style.display==="flex" && document.getElementById("chatMessages").children.length===0){
-addMessage("AI","Hello. How can I assist you today?");
-}
-}
+  // ---------- HOOK THESE TO YOUR UI ----------
+  // Replace these with your actual DOM functions
+  function uiStatus(text) { if (CFG.debug) console.log("[status]", text); }
+  function uiSystem(text) { console.log("[system]", text); }
+  function uiUser(text)   { console.log("[you]", text); }
+  function uiAI(text)     { console.log("[ai]", text); }
 
-function addMessage(sender,text){
-const div=document.createElement("div");
-div.className="msg";
-div.innerHTML="<b>"+sender+":</b> "+text;
-document.getElementById("chatMessages").appendChild(div);
-document.getElementById("chatMessages").scrollTop=99999;
-}
+  function setMode(mode, err) {
+    state.mode = mode;
+    if (err) state.error = err;
+    uiStatus(`${mode}${err ? ": " + err : ""}`);
+  }
 
-function generateReply(text){
-text=text.toLowerCase();
+  // ---------- SUPPORT CHECK ----------
+  function supported() {
+    return !!(window.SpeechRecognition || window.webkitSpeechRecognition) &&
+           !!navigator.mediaDevices?.getUserMedia;
+  }
 
-if(text.includes("consult")){
-let item=INVENTORY[0];
-if(MODE==="professional"){
-return item.name+" is available. Price is $"+item.price+". We currently have "+item.qty+" slots available.";
-}else{
-return "Yeah mate, we’ve got "+item.name+" going for $"+item.price+" and "+item.qty+" spots left. Keen?";
-}
-}
+  // ---------- ENABLE VOICE (ONE TIME) ----------
+  async function enableVoiceOnce() {
+    state.stopAll = false;
+    setMode("permission");
 
-if(MODE==="professional"){
-return "Thank you for your enquiry. Please let me know how I may assist further.";
-}else{
-return "Hey legend, what else you chasing today?";
-}
-}
+    if (!supported()) {
+      state.voiceEnabled = false;
+      setMode("error", "Browser does not support speech recognition.");
+      uiSystem("Voice unavailable on this browser.");
+      return false;
+    }
 
-function sendMessage(){
-const input=document.getElementById("chatInput");
-if(!input.value.trim())return;
-addMessage("You",input.value);
-addMessage("AI",generateReply(input.value));
-input.value="";
-}
+    // Ask permission first
+    try {
+      state.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      state.voiceEnabled = false;
+      setMode("error", "Microphone permission denied.");
+      uiSystem("Microphone permission denied.");
+      return false;
+    }
 
-document.getElementById("chatInput").addEventListener("keydown",function(e){
-if(e.key==="Enter")sendMessage();
+    // Build recognition
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new SR();
+    rec.lang = CFG.lang;
+    rec.interimResults = true;      // we want real-time, but only send final
+    rec.continuous = true;          // keep listening
+    // Some Chrome versions support these:
+    try { rec.maxAlternatives = 1; } catch {}
+    // Try to reduce "retained" phrases by resetting on each cycle (we do anyway)
+
+    rec.onstart = () => {
+      state.isUserSpeaking = false;
+      setMode("listening");
+    };
+
+    rec.onresult = (e) => {
+      // Build current utterance
+      let interim = "";
+      let finalText = "";
+
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        const t = (r[0]?.transcript || "").trim();
+        if (!t) continue;
+        if (r.isFinal) finalText += (finalText ? " " : "") + t;
+        else interim += (interim ? " " : "") + t;
+      }
+
+      // Show "live" listening text if you want (optional)
+      // IMPORTANT: We do NOT retain it for next turn.
+      if (interim) {
+        state.lastTranscript = interim;
+        state.isUserSpeaking = true;
+      }
+
+      if (finalText) {
+        // Clear buffer immediately so it doesn't "retain"
+        state.lastTranscript = "";
+        state.isUserSpeaking = false;
+
+        // Stop recognition so we can send + speak without it hearing itself
+        safeStopRecognition();
+
+        // Send this finalText automatically
+        handleFinalUtterance(finalText);
+      }
+    };
+
+    rec.onerror = (e) => {
+      const msg = e?.error || "speech_error";
+      // Common: "no-speech" / "aborted" / "audio-capture" / "not-allowed"
+      if (state.stopAll) return;
+
+      // If it aborted because we stopped it intentionally, ignore
+      if (msg === "aborted") return;
+
+      setMode("error", msg);
+      uiSystem("Voice error: " + msg);
+
+      // Auto-recover
+      if (state.voiceEnabled && state.handsFree) {
+        setTimeout(() => safeStartRecognition(), 500);
+      }
+    };
+
+    rec.onend = () => {
+      if (state.stopAll) return;
+      // If hands-free and not speaking/thinking, restart listening
+      if (state.voiceEnabled && state.handsFree && state.mode !== "thinking" && state.mode !== "speaking") {
+        setTimeout(() => safeStartRecognition(), 250);
+      }
+    };
+
+    state.recognition = rec;
+    state.voiceEnabled = true;
+    setMode("ready");
+    uiSystem("Voice enabled. Hands-free listening is ON.");
+    return true;
+  }
+
+  // ---------- START/STOP RECOGNITION SAFELY ----------
+  function safeStartRecognition() {
+    if (!state.recognition || state.stopAll) return;
+    if (state.mode === "speaking" || state.mode === "thinking") return;
+
+    try { state.recognition.start(); } catch (e) {
+      // If already started, ignore
+    }
+  }
+
+  function safeStopRecognition() {
+    if (!state.recognition) return;
+    try { state.recognition.onresult = state.recognition.onresult; } catch {}
+    try { state.recognition.stop(); } catch {}
+  }
+
+  // ---------- SEND TO CHAT API ----------
+  async function callChatApi(userText) {
+    // Abort previous
+    if (state.abortCtrl) state.abortCtrl.abort();
+    state.abortCtrl = new AbortController();
+
+    // IMPORTANT:
+    // If your backend isn't actually working yet, this will fail.
+    // But the hands-free voice loop logic is correct.
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: state.abortCtrl.signal,
+      body: JSON.stringify({ text: userText })
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error("API error: " + res.status + " " + t);
+    }
+
+    const data = await res.json();
+    return data.reply || data.text || "";
+  }
+
+  async function handleFinalUtterance(finalText) {
+    uiUser(finalText);
+    setMode("thinking");
+
+    let reply = "";
+    try {
+      reply = await callChatApi(finalText);
+    } catch (e) {
+      setMode("error", e.message || "chat_error");
+      uiSystem("Chat failed: " + (e.message || "unknown"));
+      // After error, go back to listening
+      setTimeout(() => {
+        setMode("ready");
+        safeStartRecognition();
+      }, 500);
+      return;
+    }
+
+    uiAI(reply || "(no reply)");
+
+    if (CFG.speakReplies && reply) {
+      await speak(reply);
+    }
+
+    // Loop back to listening automatically
+    setMode("ready");
+    if (state.voiceEnabled && state.handsFree) {
+      setTimeout(() => safeStartRecognition(), CFG.autoRestartDelayMs);
+    }
+  }
+
+  // ---------- TTS (optional) ----------
+  function speak(text) {
+    return new Promise((resolve) => {
+      if (!CFG.speakReplies || !("speechSynthesis" in window)) return resolve();
+
+      state.speaking = true;
+      setMode("speaking");
+
+      // Cancel anything queued
+      try { window.speechSynthesis.cancel(); } catch {}
+
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = CFG.lang;
+
+      u.onend = () => { state.speaking = false; resolve(); };
+      u.onerror = () => { state.speaking = false; resolve(); };
+
+      // Prevent recognition from hearing itself
+      safeStopRecognition();
+
+      window.speechSynthesis.speak(u);
+    });
+  }
+
+  // ---------- PUBLIC CONTROLS ----------
+  async function enableVoiceAndStart() {
+    const ok = await enableVoiceOnce();
+    if (ok) safeStartRecognition();
+  }
+
+  function stopAll() {
+    state.stopAll = true;
+    state.voiceEnabled = false;
+    try { window.speechSynthesis?.cancel?.(); } catch {}
+    safeStopRecognition();
+    if (state.micStream) {
+      state.micStream.getTracks().forEach(t => t.stop());
+      state.micStream = null;
+    }
+    setMode("idle");
+    uiSystem("Voice stopped.");
+  }
+
+  return {
+    enableVoiceAndStart,
+    stopAll,
+    // optional toggles:
+    setSpeakReplies(v){ CFG.speakReplies = !!v; },
+    setDebug(v){ CFG.debug = !!v; },
+  };
+})();
+
+/* =========================================================
+   BUTTON WIRING
+   Replace these IDs with your actual button IDs.
+   - Enable Voice button should call enableVoiceAndStart()
+   - Talk button can be removed or hidden (not needed)
+   ========================================================= */
+
+document.getElementById("enableVoiceBtn")?.addEventListener("click", () => {
+  CCare.enableVoiceAndStart();
+});
+
+// Optional stop button
+document.getElementById("stopVoiceBtn")?.addEventListener("click", () => {
+  CCare.stopAll();
 });
 </script>
-
-</body>
-</html>
